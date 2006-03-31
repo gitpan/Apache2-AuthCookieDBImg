@@ -183,7 +183,7 @@ package Apache2::AuthCookieDBImg;
 use strict;
 use 5.004;
 use vars qw( $VERSION );
-$VERSION = '2.1';
+$VERSION = '2.2';
 
 use Apache2::AuthCookie;
 use vars qw( @ISA );
@@ -221,6 +221,7 @@ sub group($$\@);
 use vars qw( %CIPHERS );
 # Stores Cipher::CBC objects in $CIPHERS{ idea:AuthName },
 # $CIPHERS{ des:AuthName } etc.
+our @Extra_Data;		# CSA Patch - needed for keeping cookie active
 
 
 #===============================================================================
@@ -395,6 +396,14 @@ by deleting the user''s session.  Authentication will then fail for them.
 This is not required and defaults to none, meaning no session objects will
 be created.
 
+=item C<WhatEverDBI_SessionActiveReset>
+
+Force the session cookie expiration to reset whenever user activity is
+detected (new page loaded, etc.).  This allows a low expiration time (5 minutes)
+that logs off when a session is inactive.  Active sessions will be granted
+more time each time they perform an action.
+
+This is not required and defaults to 0 (Expire X minutes after initial logon).
 
 =cut
 
@@ -427,6 +436,9 @@ sub _dbi_config_vars($) {
     $c{ DBI_encryptiontype } = _dir_config_var( $r, 'DBI_EncryptionType' )    	         || 'none';
     $c{ DBI_sessionlifetime} = _dir_config_var( $r, 'DBI_SessionLifetime') 					|| '00-24-00-00';
     $c{ DBI_sessionmodule 	} = _dir_config_var( $r, 'DBI_SessionModule'  );
+    $c{ DBI_SessionActiveReset } = _dir_config_var( $r, 'DBI_SessionActiveReset' ) 			|| 0;
+
+    return %c;
 
     # If we used encryption we need to pull in Crypt::CBC.
     require Crypt::CBC if ( $c{ DBI_encryptiontype } ne 'none' );
@@ -507,29 +519,32 @@ sub authen_cred($$\@)
     # Username goes in credential_0
     my $user = shift @credentials;
     unless ( $user =~ /^.+$/ ) {
-        $r->log_error( "Apache2::AuthCookieDBImg: no username supplied for auth realm $auth_name", $r->uri );
+        $r->log_error( "Apache2::AuthCookieDBI: no username supplied for auth realm $auth_name", $r->uri );
         return undef;
     }
     # Password goes in credential_1
     my $password = shift @credentials;
     unless ( $password =~ /^.+$/ ) {
-        $r->log_error( "Apache2::AuthCookieDBImg: no password supplied for auth realm $auth_name", $r->uri );
+        $r->log_error( "Apache2::AuthCookieDBI: no password supplied for auth realm $auth_name", $r->uri );
         return undef;
     }
 
+	 # CSA Patch - Use global var
+	 # needed later for authen_sess_key
+	 # to keep cookie alive
+	 #
     # Extra data can be put in credential_2, _3, etc.
-	 #
-	 # image match text goes in credential_2 (if needed)
-	 #
-    my @extra_data = @credentials;
+    # my @extra_data = @credentials;
+	 @Extra_Data = @credentials;
 
     # get the configuration information.
     my %c = _dbi_config_vars $r;
 
     # get the crypted password from the users database for this user.
-    my $dbh = DBI->connect( $c{ DBI_DSN }, $c{ DBI_user }, $c{ DBI_password } );
+    my $dbh = DBI->connect( $c{ DBI_DSN },
+                            $c{ DBI_user }, $c{ DBI_password } );
     unless ( defined $dbh ) {
-        $r->log_error( "Apache2::AuthCookieDBImg: couldn't connect to $c{ DBI_DSN } for auth realm $auth_name", $r->uri );
+        $r->log_error( "Apache2::AuthCookieDBI: couldn't connect to $c{ DBI_DSN } for auth realm $auth_name", $r->uri );
         return undef;
     }
     my $sth = $dbh->prepare( <<"EOS" );
@@ -538,125 +553,38 @@ FROM $c{ DBI_userstable }
 WHERE $c{ DBI_userfield } = ?
 EOS
     $sth->execute( $user );
+
+    # CSA Patch - No need to add array overhead when fetching a single field
+    # my( $crypted_password ) = $sth->fetchrow_array;
     my $crypted_password = $sth->fetchrow;
     unless ( defined $crypted_password ) {
-        $r->log_error( "Apache2::AuthCookieDBImg: couldn't select password field $c{ DBI_passwordfield } from $c{ DBI_DSN }::$c{ DBI_userstable }, $c{ DBI_userfield } for user $user for auth realm $auth_name", $r->uri );        return undef;
+        $r->log_error( "Apache2::AuthCookieDBI: couldn't select password from $c{ DBI_DSN }, $c{ DBI_userstable }, $c{ DBI_userfield } for user $user for auth realm $auth_name", $r->uri );
+        return undef;
     }
-
+   
     # now return unless the passwords match.
     if ( lc $c{ DBI_crypttype } eq 'none' ) {
         unless ( $password eq $crypted_password ) {
-            $r->log_error( "Apache2::AuthCookieDBImg: plaintext passwords didn't match for user $user for auth realm $auth_name", $r->uri );
+            $r->log_error( "Apache2::AuthCookieDBI: plaintext passwords didn't match for user $user for auth realm $auth_name", $r->uri );
             return undef;
         }
     } elsif ( lc $c{ DBI_crypttype } eq 'crypt' ) {
         my $salt = substr $crypted_password, 0, 2;
         unless ( crypt( $password, $salt ) eq $crypted_password ) {
-            $r->log_error( "Apache2::AuthCookieDBImg: crypted passwords didn't match for user $user for auth realm $auth_name", $r->uri );
+            $r->log_error( "Apache2::AuthCookieDBI: crypted passwords didn't match for user $user for auth realm $auth_name", $r->uri );
             return undef;
         }
     } elsif ( lc $c{ DBI_crypttype } eq 'md5' ) {
         unless ( md5_hex( $password ) eq $crypted_password ) {
-            $r->log_error( "Apache2::AuthCookieDBImg: MD5 passwords didn't match for user $user for auth realm $auth_name", $r->uri );
+            $r->log_error( "Apache2::AuthCookieDBI: MD5 passwords didn't match for user $user for auth realm $auth_name", $r->uri );
             return undef;
         }
     }
 
-	# Image Match Processing
-	#
-	if ( $c{DBI_imgwordfield} && $c{DBI_imgtable} && $c{DBI_imgkeyfield}) { 
-
-		 # Image word match goes in credential_2		
-		 my $imgword = shift @extra_data;
-		 unless ( $imgword =~ /^.+$/ ) {
-			  $r->log_error( "Apache2::AuthCookieDBImg: no image word supplied", $r->uri );
-			  return undef;
-		 }
-
-		# Retrieve from DB
-		# image key goes in credential_3 (that is what we lookup in the image DB)
-		 my $sth = $dbh->prepare(qq[SELECT $c{ DBI_imgwordfield } FROM $c{ DBI_imgtable } WHERE $c{ DBI_imgkeyfield } = ?]);
-    	 $sth->execute( shift @extra_data );
-			my $dbword = $sth->fetchrow;
-				$dbword =~ s/\s+$//o;
-        unless ( $imgword eq  $dbword) {
-            $r->log_error( "Apache2::AuthCookieDBImg: Image word '$imgword' did not match '$dbword'", $r->uri );
-            return undef;
-        }		
-	}
-
-    # Create the expire time for the ticket.
-    my $expire_time;
-    # expire time in a zillion years if it's forever.
-    if ( lc $c{ DBI_sessionlifetime } eq 'forever' ) {
-        $expire_time = '9999-01-01-01-01-01';
-    } else {
-        my( $deltaday, $deltahour, $deltaminute, $deltasecond )
-           = split /-/, $c{ DBI_sessionlifetime };
-        # Figure out the expire time.
-        $expire_time = sprintf(
-            '%04d-%02d-%02d-%02d-%02d-%02d',
-            Add_Delta_DHMS( Today_and_Now,
-                            $deltaday, $deltahour,
-                    $deltaminute, $deltasecond )
-        );
-    }
-
-    # Now we need to %-encode non-alphanumberics in the username so we
-    # can stick it in the cookie safely.
-    my $enc_user = _percent_encode $user;
-
-    # If we are using sessions, we create a new session for this login.
-    my $session_id = '';
-    if ( defined $c{ DBI_sessionmodule } ) {
-        my %session;
-        tie %session, $c{ DBI_sessionmodule }, undef, +{
-          Handle => $dbh,
-          LockHandle => $dbh,
-        };
-        $session_id = $session{ _session_id };
-        $r->pnotes( $auth_name, \%session );
-        $session{ user } = $user;
-        $session{ extra_data } = \@extra_data;
-    }
-
-    # OK, now we stick the username and the current time and the expire
-    # time and the session id (if any) together to make the public part
-    # of the session key:
-    my $current_time = _now_year_month_day_hour_minute_second;
-    my $public_part = "$enc_user:$current_time:$expire_time:$session_id";
-    $public_part .= $self->extra_session_info($r,@credentials);
-
-    # Now we calculate the hash of this and the secret key and then
-    # calculate the hash of *that* and the secret key again.
-    my $secretkey = $c{DBI_secretkey};
-    unless ( defined $secretkey ) {
-        $r->log_error( "Apache2::AuthCookieDBImg: didn't have the secret key for auth realm $auth_name", $r->uri );
-        return undef;
-    }
-    my $hash = md5_hex( join ':', $secretkey, md5_hex(
-        join ':', $public_part, $secretkey
-    ) );
-
-    # Now we add this hash to the end of the public part.
-    my $session_key = "$public_part:$hash";
-
-    # Now we encrypt this and return it.
-    my $encrypted_session_key;
-    if ( $c{ DBI_encryptiontype } eq 'none' ) {
-        $encrypted_session_key = $session_key;
-    } elsif ( lc $c{ DBI_encryptiontype } eq 'des'      ) {
-        $CIPHERS{ "des:$auth_name"}				||= Crypt::CBC->new( $secretkey, 'DES'      );
-        $encrypted_session_key = $CIPHERS{"des:$auth_name"}->encrypt_hex( $session_key );
-    } elsif ( lc $c{ DBI_encryptiontype } eq 'idea'     ) {
-        $CIPHERS{ "idea:$auth_name"      }	||= Crypt::CBC->new( $secretkey, 'IDEA'     );
-        $encrypted_session_key = $CIPHERS{"idea:$auth_name"}->encrypt_hex( $session_key );
-    } elsif ( lc $c{ DBI_encryptiontype } eq 'blowfish' ) {
-        $CIPHERS{ "blowfish:$auth_name" }		||= Crypt::CBC->new( $secretkey, 'Blowfish' );
-        $encrypted_session_key = $CIPHERS{"blowfish:$auth_name"}->encrypt_hex( $session_key );
-    }
-
-    return $encrypted_session_key;
+    # CSA Patch - New gen_key function for activity reset
+	 # on cookies
+    #
+    return $self->gen_key($r, $user, \@Extra_Data);
 }
 
 #-------------------------------------------------------------------------------
@@ -668,8 +596,12 @@ sub authen_ses_key($$$)
 
     my $auth_name = $r->auth_name;
 
+	 # Enable Debugging In Here
+    my $debug = $r->dir_config("AuthCookieDebug") || 0;
+
     # Get the configuration information.
     my %c = _dbi_config_vars $r;
+
 
     # Get the secret key.
     my $secretkey = $c{ DBI_secretkey };
@@ -784,9 +716,136 @@ sub authen_ses_key($$$)
     # in the past that we want to get rid of). *** TODO ***
     # if ( lc $c{ DBI_AlwaysUseCurrentSessionLifetime } eq 'on' ) {
 
+
+	 # Expire Time Update (Inactivity Timer vs. Hard Time)
+	 # If SessionActiveReset Flag Is On
+	 #
+	 if ($c{ DBI_SessionActiveReset}) {
+	  	my $ses_key = $self->gen_key($r, $user, \@Extra_Data);
+ 		$self->send_cookie($r, $ses_key);
+	   $r->server->warn('Apache2:AuthCookieDBI: extended() '.$ses_key) if $debug >= 3;
+ 	 }
+
+
     # They must be okay, so return the user.
     return $user;
 }
+
+#-------------------------------------------------------------------------------
+# 
+# Separated gen_key from authen_cred
+#
+sub gen_key($$$)
+{
+	my( $self, $r, $user, $refExtraData ) = @_;
+
+	my %c 			= _dbi_config_vars $r;
+	my $auth_name 	= $r->auth_name;
+
+	#----- Generate The Key Stuff...
+
+    # Create the expire time for the ticket.
+    my $expire_time;
+    # expire time in a zillion years if it's forever.
+    if ( lc $c{ DBI_sessionlifetime } eq 'forever' ) {
+        $expire_time = '9999-01-01-01-01-01';
+    } else {
+        my( $deltaday, $deltahour, $deltaminute, $deltasecond )
+           = split /-/, $c{ DBI_sessionlifetime };
+        # Figure out the expire time.
+        $expire_time = sprintf(
+            '%04d-%02d-%02d-%02d-%02d-%02d',
+            Add_Delta_DHMS( Today_and_Now,
+                            $deltaday, $deltahour,
+                    $deltaminute, $deltasecond )
+        );
+    }
+
+    # Now we need to %-encode non-alphanumberics in the username so we
+    # can stick it in the cookie safely.
+    my $enc_user = _percent_encode $user;
+
+	#---- CSA :: NEW 2.03 Session Stuff
+	# If we are using sessions, we create a new session for this login.
+	my $session_id = '';
+	if ( defined $c{ DBI_sessionmodule } ) {
+	    my $dbh = DBI->connect( $c{ DBI_DSN },
+	                            $c{ DBI_user }, $c{ DBI_password } );
+	    unless ( defined $dbh ) {
+	        $r->log_error( "Apache2::AuthCookieDBI: couldn't connect to $c{ DBI_DSN } for auth realm $auth_name", $r->uri );
+	        return undef;
+	    }
+
+	  my %session;
+	  tie %session, $c{ DBI_sessionmodule }, undef, +{
+	    Handle => $dbh,
+	    LockHandle => $dbh,
+	  };
+	  $session_id = $session{ _session_id };
+	  $r->pnotes( $auth_name, \%session );
+	  $session{ user } = $user;
+	  $session{ extra_data } = $refExtraData;
+	}
+	
+	# OK, now we stick the username and the current time and the expire
+	# time and the session id (if any) together to make the public part
+	# of the session key:
+	my $current_time = _now_year_month_day_hour_minute_second;
+	my $public_part = "$enc_user:$current_time:$expire_time:$session_id";
+	$public_part .= $self->extra_session_info($r,@Extra_Data);
+
+	#----- CSA :: End New 2.03 Session Stuff
+	#	my $current_time = _now_year_month_day_hour_minute_second;
+	#	my $public_part = "$enc_user:$current_time:$expire_time";
+
+    # OK, now we stick the username and the current time and the expire
+    # time and the session id (if any) together to make the public part
+    # of the session key:
+    my $current_time = _now_year_month_day_hour_minute_second;
+    my $public_part = "$enc_user:$current_time:$expire_time:$session_id";
+    $public_part .= $self->extra_session_info($r,@Extra_Data);
+
+    # Now we calculate the hash of this and the secret key and then
+    # calculate the hash of *that* and the secret key again.
+    my $secretkey = $c{DBI_secretkey};
+    unless ( defined $secretkey ) {
+        $r->log_error( "Apache2::AuthCookieDBI: didn't have the secret key for auth realm $auth_name", $r->uri );
+        return undef;
+    }
+    my $hash = md5_hex( join ':', $secretkey, md5_hex(
+        join ':', $public_part, $secretkey
+    ) );
+
+    # Now we add this hash to the end of the public part.
+    my $session_key = "$public_part:$hash";
+
+    # Now we encrypt this and return it.
+    my $encrypted_session_key;
+    if ( $c{ DBI_encryptiontype } eq 'none' ) {
+        $encrypted_session_key = $session_key;
+    } elsif ( lc $c{ DBI_encryptiontype } eq 'des'      ) {
+        $CIPHERS{ "des:$auth_name"      }
+           ||= Crypt::CBC->new( $secretkey, 'DES'      );
+        $encrypted_session_key = $CIPHERS{
+            "des:$auth_name"
+        }->encrypt_hex( $session_key );
+    } elsif ( lc $c{ DBI_encryptiontype } eq 'idea'     ) {
+        $CIPHERS{ "idea:$auth_name"      }
+           ||= Crypt::CBC->new( $secretkey, 'IDEA'     );
+        $encrypted_session_key = $CIPHERS{
+            "idea:$auth_name"
+        }->encrypt_hex( $session_key );
+    } elsif ( lc $c{ DBI_encryptiontype } eq 'blowfish' ) {
+        $CIPHERS{ "blowfish:$auth_name" }
+           ||= Crypt::CBC->new( $secretkey, 'Blowfish' );
+        $encrypted_session_key = $CIPHERS{
+            "blowfish:$auth_name"
+        }->encrypt_hex( $session_key );
+    }
+
+    return $encrypted_session_key;
+}
+
 
 #-------------------------------------------------------------------------------
 # Take a list of groups and make sure that the current remote user is a member
@@ -889,6 +948,9 @@ Lance Cleveland, Charleston Software Associates <info@charlestonsw.com>
 
 v2.1 - February 2006
        Significant portions based on AuthCookieDBI v2.03
+		 
+v2.2 - April 2006
+       Added SessionActiveReset configuration variable (reset logout timer)
 
 =head1 REQUIRES
 
